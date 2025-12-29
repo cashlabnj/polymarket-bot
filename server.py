@@ -1,7 +1,7 @@
 import os
 import json
 import requests
-import re # New: For better JSON parsing
+import re 
 import asyncio
 from flask import Flask, jsonify, request
 from flask_cors import CORS
@@ -16,13 +16,12 @@ CORS(app)
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-# --- UPDATED PROMPT ---
 SCOUT_PROMPT = """
 You are an Arbitrage Scout. 
 I will provide a JSON list of active markets.
 1. Determine Topic: 'geo', 'crypto', or 'mention'.
-2. Return TOP 15 markets sorted by 'Confidence'.
-3. Return ONLY JSON. Do not add markdown code blocks or commentary.
+2. Return TOP 3 markets sorted by 'Confidence'.
+3. Return ONLY JSON.
 
 Format:
 [
@@ -40,8 +39,8 @@ Format:
 def fetch_polymarket_list():
     print("Fetching Polymarket...")
     try:
-        url = "https://gamma-api.polymarket.com/markets?active=true&order=volume_24h&limit=30"
-        r = requests.get(url, timeout=10) # Added timeout
+        url = "https://gamma-api.polymarket.com/markets?active=true&order=volume_24h&limit=10"
+        r = requests.get(url, timeout=10)
         data = r.json()
         markets = []
         for m in data:
@@ -52,18 +51,18 @@ def fetch_polymarket_list():
                 "current_price": price,
                 "link": f"https://polymarket.com/event/{m.get('slug')}"
             })
-        print(f"Polymarket fetched {len(markets)} markets.")
+        print(f"✅ Polymarket fetched {len(markets)} markets.")
         return markets
     except Exception as e:
-        print(f"Poly Fetch Error: {e}")
+        print(f"❌ Poly Fetch Error: {e}")
         return []
 
 def fetch_kalshi_list():
     print("Fetching Kalshi...")
     try:
-        url = "https://trading-api.kalshi.com/v1/markets?limit=30"
+        url = "https://trading-api.kalshi.com/v1/markets?limit=10"
         headers = {"User-Agent": "Mozilla/5.0"} 
-        r = requests.get(url, headers=headers, timeout=10) # Added timeout
+        r = requests.get(url, headers=headers, timeout=10)
         
         if r.status_code == 200:
             data = r.json()
@@ -78,13 +77,13 @@ def fetch_kalshi_list():
                     "current_price": price,
                     "link": f"https://www.kalshi.com/markets/{m.get('ticker', '')}"
                 })
-            print(f"Kalshi fetched {len(markets)} markets.")
+            print(f"✅ Kalshi fetched {len(markets)} markets.")
             return markets
         else:
-            print(f"Kalshi Error Status: {r.status_code}")
+            print(f"❌ Kalshi Error Status: {r.status_code}")
             return []
     except Exception as e:
-        print(f"Kalshi Fetch Error: {e}")
+        print(f"❌ Kalshi Fetch Error: {e}")
         return []
 
 async def send_telegram_alert(market_title, edge, confidence, source):
@@ -100,19 +99,27 @@ async def send_telegram_alert(market_title, edge, confidence, source):
 
 @app.route('/api/discover', methods=['POST'])
 def discover_markets():
-    print("🔍 Start Scan...")
+    print("🔍 --- STARTING SCAN ---")
     
     try:
         poly = fetch_polymarket_list()
         kalshi = fetch_kalshi_list()
         all_markets = poly + kalshi
         
+        # --- SAFETY SWITCH ---
+        # If real APIs fail, use Mock Data so you can verify Dashboard works
         if not all_markets:
-            print("No markets found. Returning empty.")
-            return jsonify([])
+            print("⚠️ APIs returned empty data. Using MOCK DATA for diagnosis.")
+            all_markets = [
+                {"source": "Mock", "title": "Test: Will Bitcoin hit $100k?", "current_price": 0.4, "link": "#"},
+                {"source": "Mock", "title": "Test: Trump wins 2024?", "current_price": 0.6, "link": "#"},
+                {"source": "Mock", "title": "Test: Fed Rate Cut?", "current_price": 0.5, "link": "#"}
+            ]
+        else:
+            print(f"✅ Total markets found: {len(all_markets)}")
 
         scan_list = all_markets[:30] 
-        print(f"Sending {len(scan_list)} markets to AI...")
+        print(f"🤖 Sending {len(scan_list)} markets to AI...")
         
         # AI Analysis
         response = client.chat.completions.create(
@@ -125,37 +132,30 @@ def discover_markets():
         )
         
         content = response.choices[0].message.content
-        print(f"AI Raw Response: {content[:200]}...") # Log raw response
+        print(f"🧠 AI Raw Response: {content[:200]}...")
         
-        # BULLETPROOF JSON PARSING
-        # Use Regex to find the JSON list even if there is text around it
+        # Bulletproof JSON Parsing
         try:
-            # Remove markdown code blocks if present
             content = content.replace("```json", "").replace("```", "")
-            
-            # Find the list structure [ ... ]
             match = re.search(r'\[.*\]', content, re.DOTALL)
             if match:
                 content = match.group(0)
             
             picks = json.loads(content)
-            print(f"Successfully parsed {len(picks)} picks.")
+            print(f"✅ Parsed {len(picks)} picks.")
             
         except Exception as e:
-            print(f"JSON Parse Error: {e}")
-            # Return empty list so dashboard doesn't crash
+            print(f"❌ JSON Parse Error: {e}")
             return jsonify([])
         
         final_results = []
         for pick in picks:
-            # Ensure data integrity
             if 'fair_value' not in pick or 'confidence' not in pick:
                 continue
                 
             edge = pick['fair_value'] - pick['current_price']
             confidence = pick['confidence']
             
-            # Backend Alert Logic
             if confidence > 80 and edge > 0:
                 asyncio.run(send_telegram_alert(pick['title'], edge, confidence, pick.get('source','Unknown')))
 
@@ -171,12 +171,11 @@ def discover_markets():
                 "link": "https://polymarket.com"
             })
             
-        print(f"✅ Scan complete.")
+        print(f"✅ --- SCAN COMPLETE ---")
         return jsonify(final_results)
 
     except Exception as e:
-        print(f"GENERAL SERVER ERROR: {e}")
-        # Return error message so frontend shows it
+        print(f"❌ GENERAL SERVER ERROR: {e}")
         return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':
