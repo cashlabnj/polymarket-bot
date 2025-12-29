@@ -1,6 +1,7 @@
 import os
 import json
 import requests
+import re # New: For better JSON parsing
 import asyncio
 from flask import Flask, jsonify, request
 from flask_cors import CORS
@@ -15,16 +16,15 @@ CORS(app)
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-# --- UPDATED PROMPT (Less Strict for Dashboard) ---
+# --- UPDATED PROMPT ---
 SCOUT_PROMPT = """
 You are an Arbitrage Scout. 
-I will provide a JSON list of active markets. Each item has a 'title', 'source' (Kalshi or Polymarket), and 'current_price'.
-1. Analyze the Title to determine the Topic: 'geo', 'crypto', or 'mention'.
-2. Analyze the Price.
-3. Return the TOP 15 markets sorted by 'Confidence' (Highest First).
-4. Do NOT filter out low confidence markets. I need to see the full list.
+I will provide a JSON list of active markets.
+1. Determine Topic: 'geo', 'crypto', or 'mention'.
+2. Return TOP 15 markets sorted by 'Confidence'.
+3. Return ONLY JSON. Do not add markdown code blocks or commentary.
 
-Return ONLY a JSON list with this structure:
+Format:
 [
     {
         "title": "Market Name",
@@ -32,17 +32,16 @@ Return ONLY a JSON list with this structure:
         "fair_value": 0.XX,
         "confidence": 85,
         "rationale": "Reasoning...",
-        "topic": "geo" 
+        "topic": "geo"
     }
 ]
 """
 
-# --- DATA FETCHING (Keep the same as before) ---
-
 def fetch_polymarket_list():
+    print("Fetching Polymarket...")
     try:
         url = "https://gamma-api.polymarket.com/markets?active=true&order=volume_24h&limit=30"
-        r = requests.get(url)
+        r = requests.get(url, timeout=10) # Added timeout
         data = r.json()
         markets = []
         for m in data:
@@ -53,21 +52,25 @@ def fetch_polymarket_list():
                 "current_price": price,
                 "link": f"https://polymarket.com/event/{m.get('slug')}"
             })
+        print(f"Polymarket fetched {len(markets)} markets.")
         return markets
     except Exception as e:
         print(f"Poly Fetch Error: {e}")
         return []
 
 def fetch_kalshi_list():
+    print("Fetching Kalshi...")
     try:
         url = "https://trading-api.kalshi.com/v1/markets?limit=30"
         headers = {"User-Agent": "Mozilla/5.0"} 
-        r = requests.get(url, headers=headers)
+        r = requests.get(url, headers=headers, timeout=10) # Added timeout
+        
         if r.status_code == 200:
             data = r.json()
             markets_data = data.get('markets', data) if isinstance(data, dict) else data
             markets = []
             for m in markets_data:
+                if not isinstance(m, dict): continue
                 price = m.get('last_price', m.get('p_yes', 50)) / 100
                 markets.append({
                     "source": "Kalshi",
@@ -75,7 +78,11 @@ def fetch_kalshi_list():
                     "current_price": price,
                     "link": f"https://www.kalshi.com/markets/{m.get('ticker', '')}"
                 })
+            print(f"Kalshi fetched {len(markets)} markets.")
             return markets
+        else:
+            print(f"Kalshi Error Status: {r.status_code}")
+            return []
     except Exception as e:
         print(f"Kalshi Fetch Error: {e}")
         return []
@@ -84,9 +91,7 @@ async def send_telegram_alert(market_title, edge, confidence, source):
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     chat_id = os.getenv("TELEGRAM_CHAT_ID")
     if not token or not chat_id: return
-    # Only alert if VERY high confidence (>80%)
     if confidence < 80: return 
-    
     bot = Bot(token=token)
     msg = f"🚨 *HOT ALERT [{source}]*\n{market_title}\nEdge: {edge:.1%}\nConf: {confidence}%"
     try:
@@ -95,17 +100,21 @@ async def send_telegram_alert(market_title, edge, confidence, source):
 
 @app.route('/api/discover', methods=['POST'])
 def discover_markets():
-    print("🔍 Scanning...")
-    
-    poly = fetch_polymarket_list()
-    kalshi = fetch_kalshi_list()
-    all_markets = poly + kalshi
-    
-    if not all_markets: return jsonify([])
-
-    scan_list = all_markets[:30] 
+    print("🔍 Start Scan...")
     
     try:
+        poly = fetch_polymarket_list()
+        kalshi = fetch_kalshi_list()
+        all_markets = poly + kalshi
+        
+        if not all_markets:
+            print("No markets found. Returning empty.")
+            return jsonify([])
+
+        scan_list = all_markets[:30] 
+        print(f"Sending {len(scan_list)} markets to AI...")
+        
+        # AI Analysis
         response = client.chat.completions.create(
             model="gpt-4o",
             messages=[
@@ -116,15 +125,37 @@ def discover_markets():
         )
         
         content = response.choices[0].message.content
-        if "```json" in content: content = content.replace("```json", "").replace("```", "")
-        picks = json.loads(content)
+        print(f"AI Raw Response: {content[:200]}...") # Log raw response
+        
+        # BULLETPROOF JSON PARSING
+        # Use Regex to find the JSON list even if there is text around it
+        try:
+            # Remove markdown code blocks if present
+            content = content.replace("```json", "").replace("```", "")
+            
+            # Find the list structure [ ... ]
+            match = re.search(r'\[.*\]', content, re.DOTALL)
+            if match:
+                content = match.group(0)
+            
+            picks = json.loads(content)
+            print(f"Successfully parsed {len(picks)} picks.")
+            
+        except Exception as e:
+            print(f"JSON Parse Error: {e}")
+            # Return empty list so dashboard doesn't crash
+            return jsonify([])
         
         final_results = []
         for pick in picks:
+            # Ensure data integrity
+            if 'fair_value' not in pick or 'confidence' not in pick:
+                continue
+                
             edge = pick['fair_value'] - pick['current_price']
             confidence = pick['confidence']
             
-            # Backend filters for Telegram only (High Alert)
+            # Backend Alert Logic
             if confidence > 80 and edge > 0:
                 asyncio.run(send_telegram_alert(pick['title'], edge, confidence, pick.get('source','Unknown')))
 
@@ -140,12 +171,13 @@ def discover_markets():
                 "link": "https://polymarket.com"
             })
             
-        print(f"✅ Scan complete. Found {len(final_results)} results.")
+        print(f"✅ Scan complete.")
         return jsonify(final_results)
 
     except Exception as e:
-        print(f"AI Error: {e}")
-        return jsonify([])
+        print(f"GENERAL SERVER ERROR: {e}")
+        # Return error message so frontend shows it
+        return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))
