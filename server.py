@@ -15,12 +15,14 @@ CORS(app)
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-# --- UPDATED PROMPT WITH TOPIC DETECTION ---
+# --- UPDATED PROMPT (Less Strict for Dashboard) ---
 SCOUT_PROMPT = """
 You are an Arbitrage Scout. 
 I will provide a JSON list of active markets. Each item has a 'title', 'source' (Kalshi or Polymarket), and 'current_price'.
-1. Analyze the Title to determine the Topic: 'geo' (Geopolitics/Elections/Trade), 'crypto' (Blockchain/Price Action), or 'mention' (Social Media/Celebrity specific).
-2. Identify the top 3-5 markets that are UNDERPRICED (Safe Bets).
+1. Analyze the Title to determine the Topic: 'geo', 'crypto', or 'mention'.
+2. Analyze the Price.
+3. Return the TOP 15 markets sorted by 'Confidence' (Highest First).
+4. Do NOT filter out low confidence markets. I need to see the full list.
 
 Return ONLY a JSON list with this structure:
 [
@@ -30,25 +32,23 @@ Return ONLY a JSON list with this structure:
         "fair_value": 0.XX,
         "confidence": 85,
         "rationale": "Reasoning...",
-        "topic": "geo" // Must be one of: 'geo', 'crypto', 'mention'
+        "topic": "geo" 
     }
 ]
-Ignore markets with confidence below 70%.
 """
 
-# --- DATA FETCHING ---
+# --- DATA FETCHING (Keep the same as before) ---
 
 def fetch_polymarket_list():
     try:
         url = "https://gamma-api.polymarket.com/markets?active=true&order=volume_24h&limit=30"
         r = requests.get(url)
         data = r.json()
-        
         markets = []
         for m in data:
             price = m.get('prices', {}).get('mid', 0.5)
             markets.append({
-                "source": "Polymarket", # Explicitly tag the source
+                "source": "Polymarket",
                 "title": m.get('question', m.get('title')),
                 "current_price": price,
                 "link": f"https://polymarket.com/event/{m.get('slug')}"
@@ -63,7 +63,6 @@ def fetch_kalshi_list():
         url = "https://trading-api.kalshi.com/v1/markets?limit=30"
         headers = {"User-Agent": "Mozilla/5.0"} 
         r = requests.get(url, headers=headers)
-        
         if r.status_code == 200:
             data = r.json()
             markets_data = data.get('markets', data) if isinstance(data, dict) else data
@@ -71,7 +70,7 @@ def fetch_kalshi_list():
             for m in markets_data:
                 price = m.get('last_price', m.get('p_yes', 50)) / 100
                 markets.append({
-                    "source": "Kalshi", # Explicitly tag the source
+                    "source": "Kalshi",
                     "title": m.get('title', "Unknown"),
                     "current_price": price,
                     "link": f"https://www.kalshi.com/markets/{m.get('ticker', '')}"
@@ -85,13 +84,14 @@ async def send_telegram_alert(market_title, edge, confidence, source):
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     chat_id = os.getenv("TELEGRAM_CHAT_ID")
     if not token or not chat_id: return
+    # Only alert if VERY high confidence (>80%)
+    if confidence < 80: return 
+    
     bot = Bot(token=token)
-    msg = f"🚨 *ALERT [{source}]*\n{market_title}\nEdge: {edge:.1%}\nConf: {confidence}%"
+    msg = f"🚨 *HOT ALERT [{source}]*\n{market_title}\nEdge: {edge:.1%}\nConf: {confidence}%"
     try:
         await bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown")
     except: pass
-
-# --- SCANNER ROUTE ---
 
 @app.route('/api/discover', methods=['POST'])
 def discover_markets():
@@ -124,22 +124,23 @@ def discover_markets():
             edge = pick['fair_value'] - pick['current_price']
             confidence = pick['confidence']
             
-            if confidence > 75 and edge > 0:
-                asyncio.run(send_telegram_alert(pick['title'], edge, confidence, "AI Scout"))
+            # Backend filters for Telegram only (High Alert)
+            if confidence > 80 and edge > 0:
+                asyncio.run(send_telegram_alert(pick['title'], edge, confidence, pick.get('source','Unknown')))
 
             final_results.append({
                 "title": pick['title'],
-                "source": pick.get('source', "Unknown"), # Preserve source
-                "topic": pick.get('topic', "geo"),       # Get AI topic
+                "source": pick.get('source', "Unknown"),
+                "topic": pick.get('topic', "geo"),
                 "current_price": pick['current_price'],
                 "fair_value": pick['fair_value'],
                 "edge": edge,
                 "confidence": confidence,
                 "rationale": pick['rationale'],
-                "link": "https://polymarket.com" 
+                "link": "https://polymarket.com"
             })
             
-        print(f"✅ Found {len(final_results)} picks.")
+        print(f"✅ Scan complete. Found {len(final_results)} results.")
         return jsonify(final_results)
 
     except Exception as e:
