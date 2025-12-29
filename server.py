@@ -7,7 +7,6 @@ from flask_cors import CORS
 from openai import OpenAI
 from dotenv import load_dotenv
 from telegram import Bot
-from kalshi_python import KalshiApi
 
 load_dotenv()
 
@@ -37,9 +36,9 @@ Ignore markets with confidence below 70%.
 # --- DATA FETCHING ---
 
 def fetch_polymarket_list():
-    """Fetches top active markets from Polymarket"""
+    """Fetches top active markets from Polymarket (Public API)"""
     try:
-        # Fetch high liquidity markets to ensure relevance
+        # Fetch high liquidity markets
         url = "https://gamma-api.polymarket.com/markets?active=true&order=volume_24h&limit=30"
         r = requests.get(url)
         data = r.json()
@@ -47,7 +46,6 @@ def fetch_polymarket_list():
         markets = []
         for m in data:
             price = m.get('prices', {}).get('mid', 0.5)
-            # Clean up title (remove 'Yes/No' suffix if present)
             title = m.get('question', m.get('title'))
             
             markets.append({
@@ -62,28 +60,40 @@ def fetch_polymarket_list():
         return []
 
 def fetch_kalshi_list():
-    """Fetches top active markets from Kalshi"""
+    """Fetches top active markets from Kalshi (Using Requests directly to avoid SDK issues)"""
     try:
-        kalshi = KalshiApi(
-            key_id=os.getenv("KALSHI_KEY"), 
-            key_secret=os.getenv("KALSHI_SECRET")
-        )
-        # Fetch High Volume or Interest Rate markets
-        # Note: fetching generic 'series' might be broad, let's try to get popular ones
-        response = kalshi.get_markets(limit=30)
+        # We hit the public endpoint. Note: Kalshi public endpoints sometimes require user-agent headers.
+        url = "https://trading-api.kalshi.com/v1/markets?limit=30"
         
-        markets = []
-        if 'markets' in response:
-            for m in response['markets']:
-                # Convert 1-100 to 0-1
-                price = m.get('last_price', 50) / 100
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+        }
+        
+        r = requests.get(url, headers=headers)
+        
+        if r.status_code == 200:
+            data = r.json()
+            markets = []
+            
+            # Handle both list and wrapped list responses
+            markets_data = data.get('markets', data) if isinstance(data, dict) else data
+            
+            for m in markets_data:
+                # Kalshi prices are 1-100. Convert to 0-1.
+                # Looking for 'last_price' or 'p_yes'
+                price = m.get('last_price', m.get('p_yes', 50)) / 100
+                
                 markets.append({
                     "source": "Kalshi",
-                    "title": m.get('title'),
+                    "title": m.get('title', "Unknown Market"),
                     "current_price": price,
-                    "link": f"https://www.kalshi.com/markets/{m.get('ticker')}"
+                    "link": f"https://www.kalshi.com/markets/{m.get('ticker', '')}"
                 })
-        return markets
+            return markets
+        else:
+            print(f"Kalshi Error Status: {r.status_code}")
+            return []
+            
     except Exception as e:
         print(f"Kalshi Fetch Error: {e}")
         return []
@@ -119,8 +129,7 @@ def discover_markets():
         return jsonify([])
 
     # 2. Ask AI (Batch Analysis)
-    # We limit to top 20 total to save tokens/time and ensure quality
-    scan_list = all_markets[:20] 
+    scan_list = all_markets[:30] 
     
     try:
         response = client.chat.completions.create(
@@ -137,13 +146,12 @@ def discover_markets():
         
         picks = json.loads(content)
         
-        # 3. Format results for frontend
+        # 3. Format results
         final_results = []
         for pick in picks:
             edge = pick['fair_value'] - pick['current_price']
             confidence = pick['confidence']
             
-            # Add alert for high confidence finds
             if confidence > 75 and edge > 0:
                 asyncio.run(send_telegram_alert(pick['title'], edge, confidence))
 
@@ -155,7 +163,7 @@ def discover_markets():
                 "edge": edge,
                 "confidence": confidence,
                 "rationale": pick['rationale'],
-                "link": "https://polymarket.com" # Fallback link
+                "link": "https://polymarket.com" 
             })
             
         print(f"✅ Scan complete. Found {len(final_results)} picks.")
