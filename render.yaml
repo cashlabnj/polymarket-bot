@@ -1,21 +1,8 @@
 services:
   - type: web
     name: poly-backend
-    runtime: python
+    env: python
+    plan: free # Change to standard if you want
+    runtime: python-3.11 # THIS FORCES THE VERSION
     buildCommand: pip install -r requirements.txt
     startCommand: python server.py
-    envVars:
-      - key: OPENAI_API_KEY
-        sync: false
-      - key: TELEGRAM_BOT_TOKEN
-        sync: false
-      - key: TELEGRAM_CHAT_ID
-        sync: false
-
-# This runs the agent every hour (0 * * * *) even if no one visits the site
-crons:
-  - name: hourly-scan
-    schedule: "0 * * * *" # Run every hour
-    command: "python server.py &" 
-    # Note: A true cron job usually needs a separate script to run and exit, 
-    # but this creates a heartbeat for you. For full automation, we would create a `worker.py`.
