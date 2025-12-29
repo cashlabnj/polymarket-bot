@@ -7,7 +7,7 @@ from flask_cors import CORS
 from openai import OpenAI
 from dotenv import load_dotenv
 from telegram import Bot
-from kalshi_python import KalshiApi # Official SDK
+from kalshi_python import KalshiApi
 
 load_dotenv()
 
@@ -16,133 +16,154 @@ CORS(app)
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-# --- REAL DATA FETCHING ---
+# --- BATCH SCANNER AGENT PROMPT ---
+SCOUT_PROMPT = """
+You are a high-speed Arbitrage Scout for Prediction Markets. 
+I will provide a JSON list of active markets with their titles and current prices (0.0 - 1.0).
+Analyze them ALL. Identify the top 3-5 markets that are UNDERPRICED (Safe Bets).
+For the top picks, return ONLY a JSON list with this structure:
+[
+    {
+        "title": "Market Name",
+        "current_price": 0.XX,
+        "fair_value": 0.XX,
+        "confidence": 85,
+        "rationale": "Reasoning..."
+    }
+]
+Ignore markets with confidence below 70%.
+"""
 
-def get_kalshi_price(ticker):
-    """Fetches latest price from Kalshi API"""
+# --- DATA FETCHING ---
+
+def fetch_polymarket_list():
+    """Fetches top active markets from Polymarket"""
     try:
-        # You need to get your Key ID and Secret from Kalshi dashboard
-        kalshi_api = KalshiApi(
+        # Fetch high liquidity markets to ensure relevance
+        url = "https://gamma-api.polymarket.com/markets?active=true&order=volume_24h&limit=30"
+        r = requests.get(url)
+        data = r.json()
+        
+        markets = []
+        for m in data:
+            price = m.get('prices', {}).get('mid', 0.5)
+            # Clean up title (remove 'Yes/No' suffix if present)
+            title = m.get('question', m.get('title'))
+            
+            markets.append({
+                "source": "Polymarket",
+                "title": title,
+                "current_price": price,
+                "link": f"https://polymarket.com/event/{m.get('slug')}"
+            })
+        return markets
+    except Exception as e:
+        print(f"Poly Fetch Error: {e}")
+        return []
+
+def fetch_kalshi_list():
+    """Fetches top active markets from Kalshi"""
+    try:
+        kalshi = KalshiApi(
             key_id=os.getenv("KALSHI_KEY"), 
             key_secret=os.getenv("KALSHI_SECRET")
         )
+        # Fetch High Volume or Interest Rate markets
+        # Note: fetching generic 'series' might be broad, let's try to get popular ones
+        response = kalshi.get_markets(limit=30)
         
-        # Get market info
-        response = kalshi_api.get_market(ticker=ticker)
-        
-        if 'market' in response and 'last_price' in response['market']:
-            # Kalshi price is 1-100, we convert to 0.00-1.00
-            return response['market']['last_price'] / 100
-        return 0.5 # Fallback
+        markets = []
+        if 'markets' in response:
+            for m in response['markets']:
+                # Convert 1-100 to 0-1
+                price = m.get('last_price', 50) / 100
+                markets.append({
+                    "source": "Kalshi",
+                    "title": m.get('title'),
+                    "current_price": price,
+                    "link": f"https://www.kalshi.com/markets/{m.get('ticker')}"
+                })
+        return markets
     except Exception as e:
-        print(f"Kalshi Error: {e}")
-        return 0.5
+        print(f"Kalshi Fetch Error: {e}")
+        return []
 
-def get_polymarket_price(market_id):
-    """Fetches price from Polymarket Gamma API (Public)"""
-    try:
-        # Polymarket uses "slug" (URL-friendly ID) or internal ID
-        url = f"https://gamma-api.polymarket.com/markets?slug={market_id}"
-        
-        headers = {
-            "User-Agent": "Mozilla/5.0" 
-        }
-        
-        r = requests.get(url, headers=headers)
-        data = r.json()
-        
-        if data and 'markets' in data and len(data['markets']) > 0:
-            # Returns probability between 0-1
-            return data['markets'][0]['prices']['mid'] or 0.5
-            
-    except Exception as e:
-        print(f"Poly Error: {e}")
-    return 0.5 # Fallback
-
-# --- AGENT LOGIC (Keep your existing prompts here) ---
-GEO_PROMPT = """... (Keep your prompts) ..."""
-MENTION_PROMPT = """... (Keep your prompts) ..."""
-CRYPTO_PROMPT = """... (Keep your prompts) ..."""
-
-def ask_agent(agent_type, market_title, current_price):
-    # ... (Keep your existing ask_agent logic) ...
-    # For brevity in this response, I am assuming you paste the existing ask_agent code back in here
-    prompt = GEO_PROMPT
-    if agent_type == "mention": prompt = MENTION_PROMPT
-    if agent_type == "crypto": prompt = CRYPTO_PROMPT
-
-    try:
-        response = client.chat.completions.create(
-            model="gpt-4o",
-            messages=[
-                {"role": "system", "content": prompt},
-                {"role": "user", "content": f"Market: {market_title}\nCurrent Price: {current_price}"}
-            ],
-            temperature=0.3
-        )
-        content = response.choices[0].message.content
-        if "```json" in content: content = content.replace("```json", "").replace("```", "")
-        return json.loads(content)
-    except Exception as e:
-        print(f"Error: {e}")
-        return {"fair_value": current_price, "confidence": 0, "rationale": "Error"}
-
-# Telegram Logic
 async def send_telegram_alert(market_title, edge, confidence):
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     chat_id = os.getenv("TELEGRAM_CHAT_ID")
     if not token or not chat_id: return
     bot = Bot(token=token)
-    msg = f"🚨 *AI ALERT*\n{market_title}\nEdge: {edge:.1%}\nConf: {confidence}%"
+    msg = f"🚨 *NEW ARBITRAGE ALERT*\n{market_title}\nEdge: {edge:.1%}\nConf: {confidence}%"
     try:
         await bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown")
-        print("Alert sent to Telegram")
     except: pass
 
-# --- MAIN ROUTE ---
+# --- NEW SCANNER ROUTE ---
 
-@app.route('/api/analyze', methods=['POST'])
-def analyze_market():
-    data = request.json
+@app.route('/api/discover', methods=['POST'])
+def discover_markets():
+    """
+    1. Fetches all active markets from Poly/Kalshi.
+    2. Sends list to AI for batch analysis.
+    3. Returns the best bets.
+    """
+    print("🔍 Starting Scan...")
     
-    market_title = data.get('title')
-    agent_type = data.get('agent')
-    source = data.get('source').lower() # 'kalshi' or 'polymarket'
+    # 1. Gather Data
+    poly_markets = fetch_polymarket_list()
+    kalshi_markets = fetch_kalshi_list()
     
-    # --- 1. FETCH REAL PRICE ---
-    current_price = 0.5
+    all_markets = poly_markets + kalshi_markets
     
-    # We expect the HTML to send a 'ticker' field now
-    ticker = data.get('ticker') 
-    
-    if ticker:
-        if 'kalshi' in source:
-            current_price = get_kalshi_price(ticker)
-        elif 'polymarket' in source:
-            current_price = get_polymarket_price(ticker)
-    
-    print(f"Fetched Real Price for {market_title}: {current_price}")
+    if not all_markets:
+        return jsonify([])
 
-    # 2. Ask AI
-    ai_result = ask_agent(agent_type, market_title, current_price)
+    # 2. Ask AI (Batch Analysis)
+    # We limit to top 20 total to save tokens/time and ensure quality
+    scan_list = all_markets[:20] 
     
-    # 3. Calculate
-    fair_value = ai_result['fair_value']
-    confidence = ai_result['confidence']
-    edge = fair_value - current_price
-    rationale = ai_result['rationale']
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {"role": "system", "content": SCOUT_PROMPT},
+                {"role": "user", "content": json.dumps(scan_list)}
+            ],
+            temperature=0.3
+        )
+        
+        content = response.choices[0].message.content
+        if "```json" in content: content = content.replace("```json", "").replace("```", "")
+        
+        picks = json.loads(content)
+        
+        # 3. Format results for frontend
+        final_results = []
+        for pick in picks:
+            edge = pick['fair_value'] - pick['current_price']
+            confidence = pick['confidence']
+            
+            # Add alert for high confidence finds
+            if confidence > 75 and edge > 0:
+                asyncio.run(send_telegram_alert(pick['title'], edge, confidence))
 
-    # 4. Alert
-    if confidence > 70 and edge > 0:
-        asyncio.run(send_telegram_alert(market_title, edge, confidence))
+            final_results.append({
+                "title": pick['title'],
+                "source": "Mixed", 
+                "current_price": pick['current_price'],
+                "fair_value": pick['fair_value'],
+                "edge": edge,
+                "confidence": confidence,
+                "rationale": pick['rationale'],
+                "link": "https://polymarket.com" # Fallback link
+            })
+            
+        print(f"✅ Scan complete. Found {len(final_results)} picks.")
+        return jsonify(final_results)
 
-    return jsonify({
-        "current_price": current_price,
-        "fair_value": fair_value,
-        "edge": edge,
-        "confidence": confidence,
-        "rationale": rationale
-    })
+    except Exception as e:
+        print(f"AI Error: {e}")
+        return jsonify([])
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))
