@@ -4,4 +4,3 @@ requests
 python-dotenv
 flask-cors
 python-telegram-bot
-# Removed kalshi-python and cryptography
