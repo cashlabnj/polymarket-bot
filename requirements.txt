@@ -5,3 +5,4 @@ python-dotenv
 flask-cors
 python-telegram-bot
 kalshi-python
+cryptography
