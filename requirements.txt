@@ -4,3 +4,4 @@ requests
 python-dotenv
 flask-cors
 python-telegram-bot
+kalshi-python
