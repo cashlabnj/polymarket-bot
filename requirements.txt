@@ -4,5 +4,5 @@ requests
 python-dotenv
 flask-cors
 python-telegram-bot
-kalshi-python==0.1.1  <--- Pinned version & lowercase
+kalshi-python==0.1.1  
 cryptography
