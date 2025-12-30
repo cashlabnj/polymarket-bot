@@ -7,8 +7,7 @@ from flask import Flask, jsonify, request
 from flask_cors import CORS
 from dotenv import load_dotenv
 
-# --- IMPORT OFFICIAL CLIENTS ---
-from kalshi_python import KalshiApi
+# --- STANDARD CLIENTS ---
 from openai import OpenAI
 from telegram import Bot
 
@@ -37,26 +36,19 @@ Format:
 ]
 """
 
-# --- 1. POLYMARKET FETCHER ---
+# --- 1. POLYMARKET (REQUESTS) ---
 def fetch_polymarket_list():
     print("🌐 Fetching Polymarket...")
     try:
-        # Stealth Headers
         session = requests.Session()
         session.headers.update({
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
             "Accept": "application/json",
             "Referer": "https://polymarket.com/"
         })
-        
-        # Fetching 30 markets
         url = "https://gamma-api.polymarket.com/markets?active=true&order=volume_24h&limit=30"
         r = session.get(url, timeout=15)
         
-        if r.status_code != 200:
-            print(f"❌ POLY HTTP ERROR: {r.status_code}")
-            return []
-            
         data = r.json()
         markets = []
         for m in data:
@@ -67,36 +59,39 @@ def fetch_polymarket_list():
                 "current_price": price,
                 "link": f"https://polymarket.com/event/{m.get('slug')}"
             })
-        print(f"✅ POLY SUCCESS: {len(markets)} markets")
+        print(f"✅ Poly OK ({len(markets)})")
         return markets
-        
     except Exception as e:
-        print(f"❌ POLY CRASH: {e}")
+        print(f"❌ Poly Error: {e}")
         return []
 
-# --- 2. KALSHI FETCHER ---
+# --- 2. KALSHI (REQUESTS - NO SDK) ---
 def fetch_kalshi_list():
-    print("🌐 Fetching Kalshi (Official API)...")
+    print("🌐 Fetching Kalshi (Direct API)...")
     try:
-        key_id = os.getenv("KALSHI_KEY")
-        secret = os.getenv("KALSHI_SECRET")
+        session = requests.Session()
+        # Using Stealth Headers to bypass firewall
+        session.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+            "Accept": "application/json",
+            "Referer": "https://www.kalshi.com/"
+        })
         
-        if not key_id or not secret:
-            print("❌ KALSHI ERROR: KEYS MISSING IN RENDER ENV VARS")
-            return []
-
-        # Initialize Official Client
-        api = KalshiApi(key_id=key_id, key_secret=secret)
+        # Public endpoint for markets
+        url = "https://trading-api.kalshi.com/v1/markets?limit=30"
         
-        # Fetch Markets
-        response = api.get_markets(limit=30)
+        r = session.get(url, timeout=15)
         
-        if not response or 'markets' not in response:
-            print(f"❌ KALSHI ERROR: INVALID RESPONSE OR AUTH FAILED. CHECK KEYS.")
+        if r.status_code != 200:
+            print(f"❌ Kalshi HTTP {r.status_code}")
             return []
             
+        data = r.json()
+        markets_data = data.get('markets', data) if isinstance(data, dict) else data
+        
         markets = []
-        for m in response['markets']:
+        for m in markets_data:
+            if not isinstance(m, dict): continue
             # Convert 1-100 to 0-1
             price = m.get('last_price', m.get('p_yes', 50)) / 100
             markets.append({
@@ -105,12 +100,10 @@ def fetch_kalshi_list():
                 "current_price": price,
                 "link": f"https://www.kalshi.com/markets/{m.get('ticker', '')}"
             })
-        print(f"✅ KALSHI SUCCESS: {len(markets)} markets")
+        print(f"✅ Kalshi OK ({len(markets)})")
         return markets
-        
     except Exception as e:
-        print(f"❌ KALSHI CRASH: {e}")
-        # If this prints "Unauthorized", your keys are wrong.
+        print(f"❌ Kalshi Error: {e}")
         return []
 
 async def send_telegram_alert(market_title, edge, confidence, source):
@@ -125,40 +118,36 @@ async def send_telegram_alert(market_title, edge, confidence, source):
         await bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown")
     except: pass
 
-# --- 3. MAIN ROUTE ---
 @app.route('/api/discover', methods=['POST'])
 def discover_markets():
-    print("🚀 --- STARTING LIVE SCAN ---")
+    print("🚀 --- STARTING SCAN ---")
     
     try:
-        # 1. Fetch Data
         poly = fetch_polymarket_list()
         kalshi = fetch_kalshi_list()
         
         all_markets = poly + kalshi
         
-        # NO FALLBACK. If APIs fail, we return [].
         if not all_markets:
-            print("❌ CRITICAL: ALL APIs RETURNED EMPTY.")
+            print("⚠️ APIs Empty.")
             return jsonify([])
 
-        print(f"🤖 Total Markets Found: {len(all_markets)}. Sending to AI...")
+        scan_list = all_markets[:30] 
+        print(f"🤖 Sending {len(scan_list)} to AI...")
         
-        # 2. Analyze with AI
         client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
         response = client.chat.completions.create(
             model="gpt-4o",
             messages=[
                 {"role": "system", "content": SCOUT_PROMPT},
-                {"role": "user", "content": json.dumps(all_markets[:30])}
+                {"role": "user", "content": json.dumps(scan_list)}
             ],
             temperature=0.3
         )
         
         content = response.choices[0].message.content
-        print(f"🧠 AI Response Received.")
+        print(f"🧠 AI Received.")
         
-        # 3. Parse JSON
         try:
             content = content.replace("```json", "").replace("```", "")
             match = re.search(r'\[.*\]', content, re.DOTALL)
@@ -166,10 +155,9 @@ def discover_markets():
                 content = match.group(0)
             picks = json.loads(content)
         except Exception as e:
-            print(f"❌ JSON PARSE ERROR: {e}")
+            print(f"❌ JSON Error: {e}")
             return jsonify([])
         
-        # 4. Format Results
         final_results = []
         for pick in picks:
             if 'fair_value' not in pick or 'confidence' not in pick:
@@ -193,7 +181,7 @@ def discover_markets():
                 "link": "https://polymarket.com"
             })
             
-        print(f"✅ --- SCAN COMPLETE. {len(final_results)} RESULTS ---")
+        print(f"✅ --- SCAN COMPLETE ---")
         return jsonify(final_results)
 
     except Exception as e:
