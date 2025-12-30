@@ -4,5 +4,5 @@ requests
 python-dotenv
 flask-cors
 python-telegram-bot
-kalshi-python==0.1.1  
+kalshi-python
 cryptography
