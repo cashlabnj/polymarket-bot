@@ -1,8 +1,0 @@
-services:
-  - type: web
-    name: poly-backend
-    env: python
-    plan: free # Change to standard if you want
-    runtime: python-3.11 # THIS FORCES THE VERSION
-    buildCommand: pip install -r requirements.txt
-    startCommand: python server.py
